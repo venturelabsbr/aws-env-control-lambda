@@ -8,7 +8,7 @@ import {
   ModifyDBClusterCommand,
 } from "@aws-sdk/client-rds";
 
-/** Contrato da config: env HML_CONFIG (JSON) */
+/** Contrato da config: env ENV_CONFIG (JSON) */
 export interface EnvControlConfig {
   cluster: string;
   region?: string;
@@ -38,7 +38,7 @@ interface NormalizedConfig {
 }
 
 function loadConfig(): NormalizedConfig {
-  const raw = process.env.HML_CONFIG;
+  const raw = process.env.ENV_CONFIG;
   const region =
     process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? "us-east-1";
   const empty: NormalizedConfig = {
