@@ -2,10 +2,18 @@
   "name": "aws-env-control-lambda",
   "version": "1.0.0",
   "description": "Lambda AWS para ligar/desligar ambiente (ECS + Aurora/RDS) com UI e API JSON",
-  "main": "index.mjs",
+  "main": "dist/index.js",
   "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build"
+  },
   "dependencies": {
     "@aws-sdk/client-ecs": "^3.0.0",
     "@aws-sdk/client-rds": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
   }
 }
