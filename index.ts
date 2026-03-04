@@ -265,20 +265,20 @@ function statusBlock(status: EnvStatus | null): string {
   const apiLines = apis
     .map(
       (a) =>
-        `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${a.running > 0 ? "bg-emerald-500" : "bg-rose-500"}"></span><span class="text-sm text-slate-300">${a.name}</span><span class="text-sm ${a.running > 0 ? "text-emerald-400" : "text-rose-400"}">${a.running > 0 ? "Ligado" : "Desligado"}</span></div>`
+        `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${a.running > 0 ? "bg-emerald-500" : "bg-rose-500"}"></span><span class="text-sm text-slate-300">API (${a.name})</span><span class="text-sm ${a.running > 0 ? "text-emerald-400" : "text-rose-400"}">${a.running > 0 ? "Ligado" : "Desligado"}</span></div>`
     )
     .join("");
   const workerLines = workers
     .map(
       (w) =>
-        `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${w.running > 0 ? "bg-emerald-500" : "bg-rose-500"}"></span><span class="text-sm text-slate-300">${w.name}</span><span class="text-sm ${w.running > 0 ? "text-emerald-400" : "text-rose-400"}">${w.running > 0 ? "Ligado" : "Desligado"}</span></div>`
+        `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${w.running > 0 ? "bg-emerald-500" : "bg-rose-500"}"></span><span class="text-sm text-slate-300">Worker (${w.name})</span><span class="text-sm ${w.running > 0 ? "text-emerald-400" : "text-rose-400"}">${w.running > 0 ? "Ligado" : "Desligado"}</span></div>`
     )
     .join("");
   const dbLine = (d: DbStatus): string => {
     const on = dbOn(d);
     const starting = d.type === "rds" && d.status === "starting";
     const stopping = d.type === "rds" && d.status === "stopping";
-    const label = d.type === "aurora" ? `Banco ${d.id} (Aurora)` : `Banco ${d.id} (RDS)`;
+    const label = d.type === "aurora" ? `Banco (Aurora) (${d.id})` : `RDS (${d.id})`;
     const statusText = on
       ? d.type === "aurora"
         ? `Ligado (${d.minAcu ?? "?"} ACU)`
@@ -298,7 +298,7 @@ function statusBlock(status: EnvStatus | null): string {
   return `${divergenceWarning}
     <div class="mb-4 flex flex-col gap-2">
       ${apiLines}
-      <div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${appOn ? "bg-emerald-500" : "bg-rose-500"}"></span><span class="text-sm text-slate-300">App</span><span class="text-sm ${appOn ? "text-emerald-400" : "text-rose-400"}">${appOn ? "Ligado" : "Desligado"}</span></div>
+      <div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${appOn ? "bg-emerald-500" : "bg-rose-500"}"></span><span class="text-sm text-slate-300">App (${config.serviceApp})</span><span class="text-sm ${appOn ? "text-emerald-400" : "text-rose-400"}">${appOn ? "Ligado" : "Desligado"}</span></div>
       ${workerLines}
       ${dbLines}
     </div>`;
