@@ -112,6 +112,7 @@ interface EnvStatus {
 
 interface StatusItem {
   label: string;
+  resource: string;
   on: boolean;
 }
 
@@ -224,12 +225,12 @@ function statusToJson(status: EnvStatus | null): StatusJson {
       d.type === "aurora" ? (d.minAcu ?? 0) === 0 : d.status !== "available"
     );
   const dbLabel = (d: DbStatus): string =>
-    d.type === "aurora" ? `Banco ${d.id} (Aurora)` : `Banco ${d.id} (RDS)`;
+    d.type === "aurora" ? `Banco (Aurora)` : `RDS`;
   const items: StatusItem[] = [
-    ...apis.map((a) => ({ label: a.name, on: (a.running ?? 0) > 0 })),
-    { label: "App", on: appOn },
-    ...workers.map((w) => ({ label: w.name, on: (w.running ?? 0) > 0 })),
-    ...dbs.map((d) => ({ label: dbLabel(d), on: dbOn(d) })),
+    ...apis.map((a) => ({ label: "API", resource: a.name, on: (a.running ?? 0) > 0 })),
+    { label: "App", resource: config.serviceApp, on: appOn },
+    ...workers.map((w) => ({ label: "Worker", resource: w.name, on: (w.running ?? 0) > 0 })),
+    ...dbs.map((d) => ({ label: dbLabel(d), resource: d.id, on: dbOn(d) })),
   ];
   return { allOn, allOff, items };
 }

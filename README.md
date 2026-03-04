@@ -62,7 +62,22 @@ npm install github:venturelabsbr/aws-env-control-lambda --save
 
 A Lambda precisa de `dist/`, `node_modules/` e `package.json`. Duas formas:
 
+**Build determinístico (recomendado com Terraform)**
+
+Para que `source_code_hash` (e o zip) seja estável entre `plan` e `apply`, use ordem fixa de arquivos e `zip -X`:
+
+```bash
+cd node_modules/aws-env-control-lambda
+(npm ci 2>/dev/null || npm install 2>/dev/null)
+find . -type f ! -path './.git/*' | sort | zip -rq -X env-control-lambda.zip -@
+```
+
+- `find ... | sort` — ordem determinística dos arquivos.
+- `zip -rq -X` — `-X` evita metadados extras que variam entre máquinas.
+
 **Build manual (no projeto, após `npm install`):**
+
+Opção A — zipar só o necessário:
 
 ```bash
 cd node_modules/aws-env-control-lambda
@@ -72,24 +87,44 @@ zip -rq ../../env-control-lambda.zip dist node_modules package.json
 cd ../..
 ```
 
-**Build via Terraform (`null_resource`):**
+Opção B — na pasta do pacote, `npm ci` já roda `prepare` → `build`; depois zipar a pasta toda:
+
+```bash
+cd node_modules/aws-env-control-lambda
+npm ci --omit=dev
+zip -rq ../../env-control-lambda.zip .
+cd ../..
+```
+
+**Build via Terraform (determinístico)**
+
+Para o primeiro apply não falhar (o zip precisa existir para `filebase64sha256`), use `data "external"` para gerar o zip já no **plan**. Use **build determinístico** (`find | sort | zip -X`) para o hash do zip ser estável entre plan e apply — caso contrário o Terraform pode detectar mudança no código e tentar redeploy a cada apply.
 
 ```hcl
+locals {
+  env_control_source = "${path.module}/node_modules/aws-env-control-lambda"
+  env_control_zip    = "${path.module}/env-control-lambda.zip"
+  # Build determinístico: ordem fixa + zip -X = hash estável entre plan e apply
+  env_control_build_cmd = "cd ${local.env_control_source} && (npm ci 2>/dev/null || npm install 2>/dev/null) && find . -type f ! -path './.git/*' | sort | zip -rq -X ${local.env_control_zip} -@"
+}
+
+# Gera zip no plan (para filebase64sha256 no primeiro apply)
+data "external" "env_control_build" {
+  program = ["sh", "-c", "${local.env_control_build_cmd} 1>&2; echo '{\"ok\":\"1\"}'"]
+}
+
 resource "null_resource" "env_control_build" {
   triggers = {
-    package_json = filemd5("${path.module}/node_modules/aws-env-control-lambda/package.json")
+    package_json = filemd5("${local.env_control_source}/package.json")
+    code         = try(filemd5("${local.env_control_source}/index.ts"), "unknown")
   }
   provisioner "local-exec" {
-    command = <<-EOT
-      cd ${path.module}/node_modules/aws-env-control-lambda && \
-      npm ci --omit=dev && npm run build && \
-      zip -rq ${path.module}/env-control-lambda.zip dist node_modules package.json
-    EOT
+    command = local.env_control_build_cmd
   }
 }
 ```
 
-Na Lambda: `filename = "${path.module}/env-control-lambda.zip"` e `depends_on = [null_resource.env_control_build]`. Alternativa: gerar o zip no CI e referenciar o artefato.
+Na Lambda: `filename = local.env_control_zip`, `source_code_hash = filebase64sha256(local.env_control_zip)` e `depends_on = [null_resource.env_control_build]`. Alternativa: gerar o zip no CI com o mesmo comando e referenciar o artefato.
 
 ### 3. Recursos Terraform: Lambda, IAM, Function URL
 
@@ -121,7 +156,7 @@ resource "aws_iam_role_policy" "env_control" {
       },
       {
         Effect   = "Allow"
-        Action   = ["ecs:DescribeServices", "ecs:UpdateService"]
+        Action   = ["ecs:DescribeServices", "ecs:DescribeClusters", "ecs:UpdateService"]
         Resource = "*"
       },
       {
@@ -163,6 +198,7 @@ resource "aws_lambda_function" "env_control" {
   role             = aws_iam_role.env_control.arn
   handler          = "dist/index.handler"
   runtime          = "nodejs20.x"
+  timeout          = 60  # ECS/RDS podem demorar
   source_code_hash = filebase64sha256("${path.module}/env-control-lambda.zip")
 
   environment {
@@ -180,6 +216,22 @@ resource "aws_lambda_function_url" "env_control" {
   authorization_type = "NONE"
 }
 
+# Permissão para invocação pública da URL (evita 403 em muitas contas)
+resource "aws_lambda_permission" "env_control_url" {
+  statement_id           = "AllowPublicInvoke"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.env_control.function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
+}
+
+resource "aws_lambda_permission" "env_control_invoke" {
+  statement_id  = "AllowPublicInvokeFunction"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.env_control.function_name
+  principal     = "*"
+}
+
 output "env_control_url" {
   value = aws_lambda_function_url.env_control.function_url
 }
@@ -192,9 +244,9 @@ Ajuste `filename` e `source_code_hash` se o zip vier do CI. Acesse `env_control_
 | Passo | Ação |
 |-------|------|
 | 1 | `npm install github:venturelabsbr/aws-env-control-lambda` no projeto |
-| 2 | Gerar zip: no pacote, `npm ci --omit=dev`, `npm run build`, zipar `dist/`, `node_modules/`, `package.json` (manual ou `null_resource`) |
-| 3 | Criar role + policy (logs, ECS, RDS), `aws_lambda_function` com `handler = "dist/index.handler"` e `ENV_CONFIG = jsonencode(...)` |
-| 4 | `aws_lambda_function_url` para URL pública |
+| 2 | Gerar zip: **build determinístico** (`find | sort | zip -X`) no Terraform para hash estável entre plan e apply; ou manual (`npm ci` + zipar `dist node_modules package.json` ou `.`). Terraform: `data "external"` (plan) + `null_resource` (triggers no apply). |
+| 3 | Criar role + policy (logs, ECS com DescribeClusters, RDS), `aws_lambda_function` com `handler = "dist/index.handler"`, `timeout = 60` e `ENV_CONFIG = jsonencode(...)` |
+| 4 | `aws_lambda_function_url` + `aws_lambda_permission` para invocação pública (evita 403) |
 
 Para atualizar: `npm update aws-env-control-lambda`, rebuild do zip e `terraform apply`.
 
