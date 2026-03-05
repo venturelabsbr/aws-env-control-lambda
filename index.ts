@@ -265,7 +265,7 @@ function statusBlock(status: EnvStatus | null): string {
     ? `<div class="mb-4 p-3 rounded-lg bg-amber-900/50 border border-amber-600/50 text-amber-200 text-sm">Os status estão diferentes. O ambiente pode estar iniciando ou desligando; aguarde alguns minutos.</div>`
     : "";
   const tag = (type: string) =>
-    `<span class="text-xs px-1.5 py-0.5 rounded bg-slate-600 text-slate-300">${type}</span>`;
+    `<span class="ml-1 text-xs font-medium px-2 py-0.5 rounded bg-slate-600 text-slate-300 border border-slate-500">${type}</span>`;
   const line = (
     name: string,
     type: "ECS" | "RDS" | "Aurora",
@@ -275,7 +275,7 @@ function statusBlock(status: EnvStatus | null): string {
     const dot = on ? "bg-emerald-500" : "bg-rose-500";
     const text = on ? "text-emerald-400" : "text-rose-400";
     const st = statusText ?? (on ? "Ligado" : "Desligado");
-    return `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${dot}"></span><span class="text-sm text-slate-300">${name}</span>${tag(type)}<span class="text-sm ${text}">${st}</span></div>`;
+    return `<div class="flex items-center gap-2 flex-wrap"><span class="h-2.5 w-2.5 rounded-full flex-shrink-0 ${dot}"></span><span class="text-sm text-slate-300">${name}</span> ${tag(type)} <span class="text-sm ${text}">${st}</span></div>`;
   };
   const apiLines = apis
     .map((a) => line(a.name, "ECS", a.running > 0))
@@ -301,7 +301,7 @@ function statusBlock(status: EnvStatus | null): string {
     const dot = on ? "bg-emerald-500" : starting || stopping ? "bg-amber-500" : "bg-rose-500";
     const text = on ? "text-emerald-400" : starting || stopping ? "text-amber-400" : "text-rose-400";
     const typeLabel = d.type === "aurora" ? "Aurora" : "RDS";
-    return `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${dot}"></span><span class="text-sm text-slate-300">${d.id}</span>${tag(typeLabel)}<span class="text-sm ${text}">${statusText}</span></div>`;
+    return `<div class="flex items-center gap-2 flex-wrap"><span class="h-2.5 w-2.5 rounded-full flex-shrink-0 ${dot}"></span><span class="text-sm text-slate-300">${d.id}</span> ${tag(typeLabel)} <span class="text-sm ${text}">${statusText}</span></div>`;
   };
   const dbLines = dbs.map(dbLine).join("");
   return `${divergenceWarning}
