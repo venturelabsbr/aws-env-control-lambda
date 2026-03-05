@@ -111,8 +111,8 @@ interface EnvStatus {
 }
 
 interface StatusItem {
-  label: string;
   resource: string;
+  resourceType: "ECS" | "RDS" | "Aurora";
   on: boolean;
 }
 
@@ -224,13 +224,15 @@ function statusToJson(status: EnvStatus | null): StatusJson {
     dbs.every((d) =>
       d.type === "aurora" ? (d.minAcu ?? 0) === 0 : d.status !== "available"
     );
-  const dbLabel = (d: DbStatus): string =>
-    d.type === "aurora" ? `Banco (Aurora)` : `RDS`;
   const items: StatusItem[] = [
-    ...apis.map((a) => ({ label: "API", resource: a.name, on: (a.running ?? 0) > 0 })),
-    { label: "App", resource: config.serviceApp, on: appOn },
-    ...workers.map((w) => ({ label: "Worker", resource: w.name, on: (w.running ?? 0) > 0 })),
-    ...dbs.map((d) => ({ label: dbLabel(d), resource: d.id, on: dbOn(d) })),
+    ...apis.map((a) => ({ resource: a.name, resourceType: "ECS" as const, on: (a.running ?? 0) > 0 })),
+    { resource: config.serviceApp, resourceType: "ECS" as const, on: appOn },
+    ...workers.map((w) => ({ resource: w.name, resourceType: "ECS" as const, on: (w.running ?? 0) > 0 })),
+    ...dbs.map((d) => ({
+      resource: d.id,
+      resourceType: (d.type === "aurora" ? "Aurora" : "RDS") as "ECS" | "RDS" | "Aurora",
+      on: dbOn(d),
+    })),
   ];
   return { allOn, allOff, items };
 }
@@ -262,23 +264,29 @@ function statusBlock(status: EnvStatus | null): string {
   const divergenceWarning = hasDivergence
     ? `<div class="mb-4 p-3 rounded-lg bg-amber-900/50 border border-amber-600/50 text-amber-200 text-sm">Os status estão diferentes. O ambiente pode estar iniciando ou desligando; aguarde alguns minutos.</div>`
     : "";
+  const tag = (type: string) =>
+    `<span class="text-xs px-1.5 py-0.5 rounded bg-slate-600 text-slate-300">${type}</span>`;
+  const line = (
+    name: string,
+    type: "ECS" | "RDS" | "Aurora",
+    on: boolean,
+    statusText?: string
+  ): string => {
+    const dot = on ? "bg-emerald-500" : "bg-rose-500";
+    const text = on ? "text-emerald-400" : "text-rose-400";
+    const st = statusText ?? (on ? "Ligado" : "Desligado");
+    return `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${dot}"></span><span class="text-sm text-slate-300">${name}</span>${tag(type)}<span class="text-sm ${text}">${st}</span></div>`;
+  };
   const apiLines = apis
-    .map(
-      (a) =>
-        `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${a.running > 0 ? "bg-emerald-500" : "bg-rose-500"}"></span><span class="text-sm text-slate-300">API (${a.name})</span><span class="text-sm ${a.running > 0 ? "text-emerald-400" : "text-rose-400"}">${a.running > 0 ? "Ligado" : "Desligado"}</span></div>`
-    )
+    .map((a) => line(a.name, "ECS", a.running > 0))
     .join("");
   const workerLines = workers
-    .map(
-      (w) =>
-        `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${w.running > 0 ? "bg-emerald-500" : "bg-rose-500"}"></span><span class="text-sm text-slate-300">Worker (${w.name})</span><span class="text-sm ${w.running > 0 ? "text-emerald-400" : "text-rose-400"}">${w.running > 0 ? "Ligado" : "Desligado"}</span></div>`
-    )
+    .map((w) => line(w.name, "ECS", w.running > 0))
     .join("");
   const dbLine = (d: DbStatus): string => {
     const on = dbOn(d);
     const starting = d.type === "rds" && d.status === "starting";
     const stopping = d.type === "rds" && d.status === "stopping";
-    const label = d.type === "aurora" ? `Banco (Aurora) (${d.id})` : `RDS (${d.id})`;
     const statusText = on
       ? d.type === "aurora"
         ? `Ligado (${d.minAcu ?? "?"} ACU)`
@@ -292,13 +300,14 @@ function statusBlock(status: EnvStatus | null): string {
             : "Desligado";
     const dot = on ? "bg-emerald-500" : starting || stopping ? "bg-amber-500" : "bg-rose-500";
     const text = on ? "text-emerald-400" : starting || stopping ? "text-amber-400" : "text-rose-400";
-    return `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${dot}"></span><span class="text-sm text-slate-300">${label}</span><span class="text-sm ${text}">${statusText}</span></div>`;
+    const typeLabel = d.type === "aurora" ? "Aurora" : "RDS";
+    return `<div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${dot}"></span><span class="text-sm text-slate-300">${d.id}</span>${tag(typeLabel)}<span class="text-sm ${text}">${statusText}</span></div>`;
   };
   const dbLines = dbs.map(dbLine).join("");
   return `${divergenceWarning}
     <div class="mb-4 flex flex-col gap-2">
       ${apiLines}
-      <div class="flex items-center gap-2"><span class="h-2.5 w-2.5 rounded-full ${appOn ? "bg-emerald-500" : "bg-rose-500"}"></span><span class="text-sm text-slate-300">App (${config.serviceApp})</span><span class="text-sm ${appOn ? "text-emerald-400" : "text-rose-400"}">${appOn ? "Ligado" : "Desligado"}</span></div>
+      ${line(config.serviceApp, "ECS", appOn)}
       ${workerLines}
       ${dbLines}
     </div>`;

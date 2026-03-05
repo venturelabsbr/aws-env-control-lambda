@@ -60,24 +60,27 @@ npm install github:venturelabsbr/aws-env-control-lambda --save
 
 ### 2. Gerar o zip da Lambda
 
-A Lambda precisa de `dist/`, `node_modules/` e `package.json`. Duas formas:
+A Lambda usa **handler** `dist/index.handler` (ESM). O zip deve conter `dist/`, `node_modules/` e `package.json`.
+
+**Importante:** não inclua `index.mjs` nem `index.ts` na **raiz** do zip. O runtime da Lambda pode tentar carregar o módulo `"index"` e falhar com "Cannot find module 'index'". Exclua-os no `find` com `! -path './index.mjs' ! -path './index.ts'`.
 
 **Build determinístico (recomendado com Terraform)**
 
-Para que `source_code_hash` (e o zip) seja estável entre `plan` e `apply`, use ordem fixa de arquivos e `zip -X`:
+Para que `source_code_hash` seja estável entre `plan` e `apply`, use ordem fixa e `zip -X`. Exclua os arquivos de entrada na raiz para evitar conflito no runtime:
 
 ```bash
 cd node_modules/aws-env-control-lambda
 (npm ci 2>/dev/null || npm install 2>/dev/null)
-find . -type f ! -path './.git/*' | sort | zip -rq -X env-control-lambda.zip -@
+find . -type f ! -path './.git/*' ! -path './index.mjs' ! -path './index.ts' | sort | zip -rq -X env-control-lambda.zip -@
 ```
 
-- `find ... | sort` — ordem determinística dos arquivos.
-- `zip -rq -X` — `-X` evita metadados extras que variam entre máquinas.
+- `find ... ! -path './index.mjs' ! -path './index.ts'` — evita "Cannot find module 'index'" na Lambda.
+- `sort` — ordem determinística.
+- `zip -rq -X` — `-X` evita metadados que variam entre máquinas.
 
 **Build manual (no projeto, após `npm install`):**
 
-Opção A — zipar só o necessário:
+Opção A — zipar só o necessário (sem arquivos na raiz que confundam o runtime):
 
 ```bash
 cd node_modules/aws-env-control-lambda
@@ -87,44 +90,32 @@ zip -rq ../../env-control-lambda.zip dist node_modules package.json
 cd ../..
 ```
 
-Opção B — na pasta do pacote, `npm ci` já roda `prepare` → `build`; depois zipar a pasta toda:
+Opção B — zipar a pasta toda **excluindo** `index.mjs` e `index.ts` da raiz:
 
 ```bash
 cd node_modules/aws-env-control-lambda
 npm ci --omit=dev
-zip -rq ../../env-control-lambda.zip .
+find . -type f ! -path './.git/*' ! -path './index.mjs' ! -path './index.ts' | sort | zip -rq -X ../../env-control-lambda.zip -@
 cd ../..
 ```
 
 **Build via Terraform (determinístico)**
 
-Para o primeiro apply não falhar (o zip precisa existir para `filebase64sha256`), use `data "external"` para gerar o zip já no **plan**. Use **build determinístico** (`find | sort | zip -X`) para o hash do zip ser estável entre plan e apply — caso contrário o Terraform pode detectar mudança no código e tentar redeploy a cada apply.
+Use `data "external"` para gerar o zip no **plan** (assim `filebase64sha256` existe no primeiro apply). Na Lambda use `depends_on = [data.external.env_control_build]` para evitar hash diferente no apply. **Exclua** `index.mjs` e `index.ts` da raiz no `find`:
 
 ```hcl
 locals {
   env_control_source = "${path.module}/node_modules/aws-env-control-lambda"
   env_control_zip    = "${path.module}/env-control-lambda.zip"
-  # Build determinístico: ordem fixa + zip -X = hash estável entre plan e apply
-  env_control_build_cmd = "cd ${local.env_control_source} && (npm ci 2>/dev/null || npm install 2>/dev/null) && find . -type f ! -path './.git/*' | sort | zip -rq -X ${local.env_control_zip} -@"
+  env_control_build_cmd = "cd ${local.env_control_source} && (npm ci 2>/dev/null || npm install 2>/dev/null) && find . -type f ! -path './.git/*' ! -path './index.mjs' ! -path './index.ts' | sort | zip -rq -X ${local.env_control_zip} -@"
 }
 
-# Gera zip no plan (para filebase64sha256 no primeiro apply)
 data "external" "env_control_build" {
   program = ["sh", "-c", "${local.env_control_build_cmd} 1>&2; echo '{\"ok\":\"1\"}'"]
 }
-
-resource "null_resource" "env_control_build" {
-  triggers = {
-    package_json = filemd5("${local.env_control_source}/package.json")
-    code         = try(filemd5("${local.env_control_source}/index.ts"), "unknown")
-  }
-  provisioner "local-exec" {
-    command = local.env_control_build_cmd
-  }
-}
 ```
 
-Na Lambda: `filename = local.env_control_zip`, `source_code_hash = filebase64sha256(local.env_control_zip)` e `depends_on = [null_resource.env_control_build]`. Alternativa: gerar o zip no CI com o mesmo comando e referenciar o artefato.
+Na Lambda: `filename = local.env_control_zip`, `source_code_hash = filebase64sha256(local.env_control_zip)`, `handler = "dist/index.handler"` e `depends_on = [data.external.env_control_build]`.
 
 ### 3. Recursos Terraform: Lambda, IAM, Function URL
 
@@ -207,7 +198,7 @@ resource "aws_lambda_function" "env_control" {
     }
   }
 
-  depends_on = [null_resource.env_control_build] # se usar null_resource
+  depends_on = [data.external.env_control_build] # zip gerado no plan
 }
 
 # Function URL (acesso pelo navegador)
@@ -244,9 +235,9 @@ Ajuste `filename` e `source_code_hash` se o zip vier do CI. Acesse `env_control_
 | Passo | Ação |
 |-------|------|
 | 1 | `npm install github:venturelabsbr/aws-env-control-lambda` no projeto |
-| 2 | Gerar zip: **build determinístico** (`find | sort | zip -X`) no Terraform para hash estável entre plan e apply; ou manual (`npm ci` + zipar `dist node_modules package.json` ou `.`). Terraform: `data "external"` (plan) + `null_resource` (triggers no apply). |
-| 3 | Criar role + policy (logs, ECS com DescribeClusters, RDS), `aws_lambda_function` com `handler = "dist/index.handler"`, `timeout = 60` e `ENV_CONFIG = jsonencode(...)` |
-| 4 | `aws_lambda_function_url` + `aws_lambda_permission` para invocação pública (evita 403) |
+| 2 | Gerar zip: **excluir** `./index.mjs` e `./index.ts` do zip (evita "Cannot find module 'index'"). Build determinístico: `find ... ! -path './index.mjs' ! -path './index.ts' \| sort \| zip -X`. Terraform: `data "external"` no plan; Lambda `depends_on = [data.external.env_control_build]`. |
+| 3 | Lambda: `handler = "dist/index.handler"`, `runtime = "nodejs20.x"`, `timeout = 60`, `ENV_CONFIG = jsonencode(...)`. IAM: logs, ECS (DescribeClusters, DescribeServices, UpdateService), RDS (Describe*, Start*, Stop*, ModifyDBCluster). |
+| 4 | `aws_lambda_function_url` + `aws_lambda_permission` para invocação pública |
 
 Para atualizar: `npm update aws-env-control-lambda`, rebuild do zip e `terraform apply`.
 
