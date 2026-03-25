@@ -377,21 +377,38 @@ function getRawBody(event: LambdaFunctionUrlEvent): string {
   return typeof b === "string" ? b : String(b);
 }
 
+function header(
+  event: LambdaFunctionUrlEvent,
+  name: "content-type" | "accept" | "authorization"
+): string {
+  const h = event.headers;
+  if (!h) return "";
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(h)) {
+    if (k.toLowerCase() === lower && typeof v === "string") return v;
+  }
+  return "";
+}
+
 function getToken(event: LambdaFunctionUrlEvent): string {
   const q = event.queryStringParameters ?? {};
-  if (q.token) return q.token;
-  const contentType =
-    (event.headers && (event.headers["content-type"] ?? event.headers["Content-Type"])) ?? "";
+  if (q.token) return String(q.token).trim();
+
+  const auth = header(event, "authorization");
+  const bearer = /^Bearer\s+(\S+)/i.exec(auth);
+  if (bearer?.[1]) return bearer[1].trim();
+
+  const contentType = header(event, "content-type");
   const body = parseBody(getRawBody(event), contentType);
-  return (body.token as string) ?? "";
+  return String((body.token as string) ?? "").trim();
 }
 
 function wantsJson(event: LambdaFunctionUrlEvent): boolean {
   const q = event.queryStringParameters ?? {};
   if (q.format === "json") return true;
-  const accept =
-    (event.headers && (event.headers["accept"] ?? event.headers["Accept"])) ?? "";
-  return accept.includes("application/json");
+  if (header(event, "accept").toLowerCase().includes("application/json")) return true;
+  if (header(event, "content-type").toLowerCase().includes("application/json")) return true;
+  return false;
 }
 
 export const handler = async (
@@ -437,8 +454,7 @@ export const handler = async (
     return { statusCode: 405, body: "Method Not Allowed" };
   }
 
-  const contentType =
-    (event.headers && (event.headers["content-type"] ?? event.headers["Content-Type"])) ?? "";
+  const contentType = header(event, "content-type");
   const rawBody = getRawBody(event);
   const body = parseBody(rawBody, contentType);
   const action = (body.action ?? "").trim() || (event.queryStringParameters ?? {}).action;
@@ -468,7 +484,7 @@ export const handler = async (
         body: JSON.stringify({ error: "Token inválido." }),
       };
     return {
-      statusCode: 200,
+      statusCode: 403,
       headers: { "Content-Type": "text/html; charset=utf-8" },
       body: htmlPage(functionUrl, "Token inválido.", null, {
         autoRefreshSeconds: 20,
