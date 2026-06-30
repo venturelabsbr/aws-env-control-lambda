@@ -7,6 +7,15 @@ import {
   DescribeDBClustersCommand,
   ModifyDBClusterCommand,
 } from "@aws-sdk/client-rds";
+import {
+  buildScheduleJson,
+  normalizeSchedule,
+  scheduleBlockHtml,
+  type EnvScheduleJson,
+  type ScheduleInput,
+} from "./schedule.js";
+
+export type { EnvScheduleJson, EnvScheduleActionJson } from "./schedule.js";
 
 /** Contrato da config: env ENV_CONFIG (JSON) */
 export interface EnvControlConfig {
@@ -23,6 +32,7 @@ export interface EnvControlConfig {
   };
   token?: string;
   projectName?: string;
+  schedule?: ScheduleInput;
 }
 
 interface NormalizedConfig {
@@ -35,6 +45,7 @@ interface NormalizedConfig {
   dbClusterIds: string[];
   token: string;
   projectName: string;
+  schedule: ReturnType<typeof normalizeSchedule>;
 }
 
 function loadConfig(): NormalizedConfig {
@@ -51,6 +62,7 @@ function loadConfig(): NormalizedConfig {
     dbClusterIds: [],
     token: "",
     projectName: "",
+    schedule: null,
   };
   if (!raw) return empty;
   try {
@@ -67,6 +79,7 @@ function loadConfig(): NormalizedConfig {
       dbClusterIds: Array.isArray(databases.aurora) ? databases.aurora : [],
       token: String(parsed.token ?? "").trim(),
       projectName: String(parsed.projectName ?? "").trim(),
+      schedule: normalizeSchedule(parsed.schedule),
     };
   } catch {
     return empty;
@@ -120,6 +133,7 @@ interface StatusJson {
   allOn: boolean;
   allOff: boolean;
   items: StatusItem[];
+  schedule?: EnvScheduleJson;
 }
 
 interface HtmlPageOptions {
@@ -205,7 +219,8 @@ async function getStatus(): Promise<EnvStatus> {
 }
 
 function statusToJson(status: EnvStatus | null): StatusJson {
-  const empty: StatusJson = { allOn: false, allOff: true, items: [] };
+  const schedule = buildScheduleJson(config.schedule);
+  const empty: StatusJson = { allOn: false, allOff: true, items: [], ...(schedule ? { schedule } : {}) };
   if (!status) return empty;
   const appOn = (status.appRunning ?? 0) > 0;
   const apis = status.apis ?? [];
@@ -234,7 +249,7 @@ function statusToJson(status: EnvStatus | null): StatusJson {
       on: dbOn(d),
     })),
   ];
-  return { allOn, allOff, items };
+  return { allOn, allOff, items, ...(schedule ? { schedule } : {}) };
 }
 
 function statusBlock(status: EnvStatus | null): string {
@@ -323,6 +338,7 @@ function htmlPage(
   const action = functionUrl || "";
   const tokenRequired = config.token.length > 0;
   const statusHtml = statusBlock(status);
+  const scheduleHtml = scheduleBlockHtml(buildScheduleJson(config.schedule));
   const startupNotice = showStartupNotice
     ? `<div class="mb-4 p-3 rounded-lg bg-cyan-900/40 border border-cyan-600/50 text-cyan-200 text-sm">Os serviços podem levar alguns minutos para ficarem disponíveis. A página será atualizada automaticamente; evite clicar novamente.</div>`
     : "";
@@ -336,7 +352,7 @@ function htmlPage(
 <body class="min-h-screen bg-slate-900 text-slate-100 flex items-center justify-center p-4">
   <div class="w-full max-w-md rounded-xl bg-slate-800 border border-slate-700 shadow-xl p-6">
     ${config.projectName ? `<p class="text-xs text-slate-500 uppercase tracking-wider mb-1">${config.projectName}</p>` : ""}
-    <h1 class="text-xl font-semibold text-slate-100 mb-2">Controle ambiente</h1>${statusHtml}${startupNotice}
+    <h1 class="text-xl font-semibold text-slate-100 mb-2">Controle ambiente</h1>${statusHtml}${scheduleHtml}${startupNotice}
     ${message ? `<div class="mb-4 p-3 rounded-lg bg-amber-900/50 border border-amber-600/50 text-amber-200 text-sm">${message}</div>` : ""}
     <form id="env-form" action="${action}" method="POST" enctype="application/x-www-form-urlencoded" class="space-y-4">
       ${tokenRequired ? `<div><label class="block text-sm text-slate-400 mb-1">Token</label><input type="password" name="token" required class="w-full rounded-lg border border-slate-600 bg-slate-700 px-3 py-2 text-slate-100 placeholder-slate-500 focus:border-cyan-500 focus:outline-none" placeholder="Token de acesso" /></div>` : ""}

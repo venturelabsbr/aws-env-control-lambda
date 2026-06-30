@@ -24,7 +24,20 @@ Variável de ambiente na Lambda:
     "aurora": ["id-cluster-aurora-1"]
   },
   "token": "token-secreto-post",
-  "projectName": "Nome do Projeto"
+  "projectName": "Nome do Projeto",
+  "schedule": {
+    "timezone": "America/Sao_Paulo",
+    "shutdown": {
+      "enabled": true,
+      "time": "20:00",
+      "daysOfWeek": [1, 2, 3, 4, 5]
+    },
+    "startup": {
+      "enabled": true,
+      "time": "07:00",
+      "daysOfWeek": [1, 2, 3, 4, 5]
+    }
+  }
 }
 ```
 
@@ -39,14 +52,56 @@ Variável de ambiente na Lambda:
 | `databases.aurora` | Não | Array de IDs de clusters Aurora (escala 0 = desligado) |
 | `token` | Não | Token para POST (vazio = sem proteção) |
 | `projectName` | Não | Nome exibido na UI |
+| `schedule` | Não | Horários fixos semanais de ligar/desligar (ver abaixo) |
+
+### Bloco `schedule` (agendamento semanal)
+
+| Campo | Descrição |
+|-------|-----------|
+| `timezone` | Fuso IANA (ex.: `America/Sao_Paulo`). Usado no JSON (`nextAt`) e no EventBridge Scheduler. |
+| `shutdown` / `startup` | Cada um: `enabled`, `time` (`HH:mm` 24h), `daysOfWeek` (ISO: `1` = segunda … `7` = domingo). |
+| `enabled: false` | Ignora a ação no JSON e na UI. |
 
 RDS e Aurora podem ser usados ao mesmo tempo (vários de cada).
 
 ## API (Function URL)
 
-- **GET** — Página HTML com status e botões Ligar/Desligar.
-- **GET ?format=json** ou **Accept: application/json** — JSON: `{ allOn, allOff, items: [{ label, on }] }`.
-- **POST** — Ação `on` ou `off`. Body: form-urlencoded ou JSON `{ "action": "on"|"off", "token": "..." }`. Resposta JSON: `{ allOn, allOff, items, message }` ou `{ error: "..." }`.
+- **GET** — Página HTML com status, agendamento (se configurado) e botões Ligar/Desligar.
+- **GET ?format=json** ou **Accept: application/json** — JSON de status (exemplo abaixo).
+- **POST** — Ação `on` ou `off`. Body: form-urlencoded ou JSON `{ "action": "on"|"off", "token": "..." }`. Resposta JSON: mesmo shape do GET + `message` ou `{ error: "..." }`.
+
+Exemplo de resposta JSON:
+
+```json
+{
+  "allOn": false,
+  "allOff": true,
+  "items": [
+    { "resource": "meu-app", "resourceType": "ECS", "on": false }
+  ],
+  "schedule": {
+    "timezone": "America/Sao_Paulo",
+    "startup": {
+      "enabled": true,
+      "time": "07:00",
+      "daysOfWeek": [1, 2, 3, 4, 5],
+      "daysLabel": "Seg–Sex",
+      "cron": "cron(0 7 ? * MON-FRI *)",
+      "nextAt": "2026-06-05T10:00:00.000Z"
+    },
+    "shutdown": {
+      "enabled": true,
+      "time": "20:00",
+      "daysOfWeek": [1, 2, 3, 4, 5],
+      "daysLabel": "Seg–Sex",
+      "cron": "cron(0 20 ? * MON-FRI *)",
+      "nextAt": "2026-06-04T23:00:00.000Z"
+    }
+  }
+}
+```
+
+`nextAt` é ISO 8601 (UTC). `cron` segue o formato do **EventBridge Scheduler** (campo `schedule_expression`).
 
 ## Uso com Terraform
 
@@ -179,7 +234,24 @@ locals {
     }
     token       = var.env_control_token
     projectName = var.project_name
+    schedule = {
+      timezone = "America/Sao_Paulo"
+      shutdown = {
+        enabled    = true
+        time       = "20:00"
+        daysOfWeek = [1, 2, 3, 4, 5]
+      }
+      startup = {
+        enabled    = true
+        time       = "07:00"
+        daysOfWeek = [1, 2, 3, 4, 5]
+      }
+    }
   }
+
+  # Cron EventBridge a partir do ENV_CONFIG (use os mesmos valores em schedule.*)
+  env_control_startup_cron  = "cron(0 7 ? * MON-FRI *)"   # espelha schedule.startup
+  env_control_shutdown_cron = "cron(0 20 ? * MON-FRI *)"  # espelha schedule.shutdown
 }
 
 # Lambda
@@ -229,6 +301,101 @@ output "env_control_url" {
 ```
 
 Ajuste `filename` e `source_code_hash` se o zip vier do CI. Acesse `env_control_url` no navegador para ligar/desligar o ambiente.
+
+## Agendamento automático (EventBridge Scheduler)
+
+A Lambda **não dispara** o agendamento sozinha: configure no Terraform (ou console) regras que fazem **POST** na Function URL com `action=on` (ligar) e `action=off` (desligar). Os horários em `ENV_CONFIG.schedule` devem ser **os mesmos** das regras — o JSON de consulta expõe `schedule.cron` e `schedule.*.nextAt` para UIs como o `dr-env-control`.
+
+### Exemplo: Scheduler com POST HTTP na Function URL
+
+O handler da Lambda espera o formato da **Function URL** (não payload simples de `Invoke`). Use o target universal **HTTP** do EventBridge Scheduler para fazer POST na URL.
+
+Requer schedule group, IAM role (`scheduler.amazonaws.com`) com permissão de rede/HTTP, e duas schedules. Ajuste `cron`, timezone e token.
+
+```hcl
+resource "aws_scheduler_schedule_group" "env_control" {
+  name = "env-control"
+}
+
+resource "aws_iam_role" "scheduler_http" {
+  name = "env-control-scheduler-http"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "scheduler.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+locals {
+  env_control_url_json = "${trim(aws_lambda_function_url.env_control.function_url, "/")}/?format=json"
+}
+
+resource "aws_scheduler_schedule" "env_control_startup" {
+  name       = "env-control-startup"
+  group_name = aws_scheduler_schedule_group.env_control.name
+
+  schedule_expression          = local.env_control_startup_cron
+  schedule_expression_timezone = local.env_control_config.schedule.timezone
+
+  flexible_time_window { mode = "OFF" }
+
+  target {
+    arn      = "arn:aws:scheduler:::aws-sdk:http:invoke"
+    role_arn = aws_iam_role.scheduler_http.arn
+    input = jsonencode({
+      Method = "POST"
+      Url    = local.env_control_url_json
+      Headers = {
+        Accept         = ["application/json"]
+        "Content-Type" = ["application/x-www-form-urlencoded"]
+      }
+      Body = "action=on&token=${var.env_control_token}"
+    })
+  }
+}
+
+resource "aws_scheduler_schedule" "env_control_shutdown" {
+  name       = "env-control-shutdown"
+  group_name = aws_scheduler_schedule_group.env_control.name
+
+  schedule_expression          = local.env_control_shutdown_cron
+  schedule_expression_timezone = local.env_control_config.schedule.timezone
+
+  flexible_time_window { mode = "OFF" }
+
+  target {
+    arn      = "arn:aws:scheduler:::aws-sdk:http:invoke"
+    role_arn = aws_iam_role.scheduler_http.arn
+    input = jsonencode({
+      Method = "POST"
+      Url    = local.env_control_url_json
+      Headers = {
+        Accept         = ["application/json"]
+        "Content-Type" = ["application/x-www-form-urlencoded"]
+      }
+      Body = "action=off&token=${var.env_control_token}"
+    })
+  }
+}
+```
+
+Teste manual (substitua URL e token):
+
+```bash
+curl -sS -X POST "${ENV_CONTROL_URL}/?format=json" \
+  -H "Accept: application/json" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data "action=on&token=SEU_TOKEN"
+```
+
+**Notas:**
+
+- O campo `cron` no GET JSON (`schedule.startup.cron`) pode ser usado como `schedule_expression` no Scheduler.
+- Mantenha o **token** em variável sensível; não commite em repositório.
+- Se já existe regra de **desligamento** no cliente, adicione apenas `env_control_startup` e alinhe `ENV_CONFIG.schedule` com os mesmos horários.
 
 ### Resumo
 
