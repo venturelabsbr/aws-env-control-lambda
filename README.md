@@ -397,11 +397,11 @@ A resposta é o mesmo JSON de status (com o `schedule` já atualizado) + `messag
 
 A Lambda **não dispara** o agendamento sozinha: configure no Terraform (ou console) regras que fazem **POST** na Function URL com `action=on` (ligar) e `action=off` (desligar), OU use `scheduleTrigger` acima para deixar o próprio agendamento editável depois. Os horários em `ENV_CONFIG.schedule` devem ser **os mesmos** das regras — o JSON de consulta expõe `schedule.cron` e `schedule.*.nextAt` para UIs como o `dr-env-control`.
 
-### Exemplo: Scheduler com POST HTTP na Function URL
+### Exemplo: Scheduler invocando a Lambda diretamente (recomendado)
 
-O handler da Lambda espera o formato da **Function URL** (não payload simples de `Invoke`). Use o target universal **HTTP** do EventBridge Scheduler para fazer POST na URL.
+O target universal **HTTP** (`aws-sdk:http:invoke`) do EventBridge Scheduler **não está disponível em todas as contas/regiões**. O padrão recomendado é invocar a **Lambda diretamente** (`aws-sdk:lambda:invoke`), passando um payload no formato de evento da Function URL (v2.0) — o handler entende esse formato normalmente.
 
-Requer schedule group, IAM role (`scheduler.amazonaws.com`) com permissão de rede/HTTP, e duas schedules. Ajuste `cron`, timezone e token.
+Requer schedule group, IAM role (`scheduler.amazonaws.com`) com permissão `lambda:InvokeFunction`, e duas schedules. Ajuste `cron`, timezone e token.
 
 ```hcl
 resource "aws_scheduler_schedule_group" "env_control" {
@@ -420,8 +420,40 @@ resource "aws_iam_role" "scheduler_http" {
   })
 }
 
+resource "aws_iam_role_policy" "scheduler_invoke_lambda" {
+  name = "env-control-scheduler"
+  role = aws_iam_role.scheduler_http.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["lambda:InvokeFunction"]
+      Resource = aws_lambda_function.env_control.arn
+    }]
+  })
+}
+
 locals {
-  env_control_url_json = "${trim(aws_lambda_function_url.env_control.function_url, "/")}/?format=json"
+  env_control_on_payload = jsonencode({
+    version               = "2.0"
+    routeKey              = "$default"
+    rawPath               = "/"
+    headers               = { "content-type" = "application/x-www-form-urlencoded", accept = "application/json" }
+    queryStringParameters = { format = "json" }
+    requestContext        = { http = { method = "POST" } }
+    body                  = "action=on&token=${var.env_control_token}"
+    isBase64Encoded       = false
+  })
+  env_control_off_payload = jsonencode({
+    version               = "2.0"
+    routeKey              = "$default"
+    rawPath               = "/"
+    headers               = { "content-type" = "application/x-www-form-urlencoded", accept = "application/json" }
+    queryStringParameters = { format = "json" }
+    requestContext        = { http = { method = "POST" } }
+    body                  = "action=off&token=${var.env_control_token}"
+    isBase64Encoded       = false
+  })
 }
 
 resource "aws_scheduler_schedule" "env_control_startup" {
@@ -434,16 +466,12 @@ resource "aws_scheduler_schedule" "env_control_startup" {
   flexible_time_window { mode = "OFF" }
 
   target {
-    arn      = "arn:aws:scheduler:::aws-sdk:http:invoke"
+    arn      = "arn:aws:scheduler:::aws-sdk:lambda:invoke"
     role_arn = aws_iam_role.scheduler_http.arn
     input = jsonencode({
-      Method = "POST"
-      Url    = local.env_control_url_json
-      Headers = {
-        Accept         = ["application/json"]
-        "Content-Type" = ["application/x-www-form-urlencoded"]
-      }
-      Body = "action=on&token=${var.env_control_token}"
+      FunctionName   = aws_lambda_function.env_control.function_name
+      InvocationType = "Event"
+      Payload        = local.env_control_on_payload
     })
   }
 }
@@ -458,16 +486,12 @@ resource "aws_scheduler_schedule" "env_control_shutdown" {
   flexible_time_window { mode = "OFF" }
 
   target {
-    arn      = "arn:aws:scheduler:::aws-sdk:http:invoke"
+    arn      = "arn:aws:scheduler:::aws-sdk:lambda:invoke"
     role_arn = aws_iam_role.scheduler_http.arn
     input = jsonencode({
-      Method = "POST"
-      Url    = local.env_control_url_json
-      Headers = {
-        Accept         = ["application/json"]
-        "Content-Type" = ["application/x-www-form-urlencoded"]
-      }
-      Body = "action=off&token=${var.env_control_token}"
+      FunctionName   = aws_lambda_function.env_control.function_name
+      InvocationType = "Event"
+      Payload        = local.env_control_off_payload
     })
   }
 }
