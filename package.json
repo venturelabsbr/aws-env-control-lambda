@@ -9,8 +9,11 @@
     "prepare": "npm run build"
   },
   "dependencies": {
+    "@aws-sdk/client-application-auto-scaling": "^3.0.0",
     "@aws-sdk/client-ecs": "^3.0.0",
     "@aws-sdk/client-rds": "^3.0.0",
+    "@aws-sdk/client-scheduler": "^3.0.0",
+    "@aws-sdk/client-ssm": "^3.0.0",
     "cron-parser": "^4.9.0"
   },
   "devDependencies": {

@@ -7,15 +7,44 @@ import {
   DescribeDBClustersCommand,
   ModifyDBClusterCommand,
 } from "@aws-sdk/client-rds";
+import { SSMClient, GetParameterCommand, PutParameterCommand } from "@aws-sdk/client-ssm";
+import { SchedulerClient, GetScheduleCommand, UpdateScheduleCommand } from "@aws-sdk/client-scheduler";
+import {
+  ApplicationAutoScalingClient,
+  PutScheduledActionCommand,
+  DeleteScheduledActionCommand,
+} from "@aws-sdk/client-application-auto-scaling";
 import {
   buildScheduleJson,
   normalizeSchedule,
+  toEventBridgeCron,
   scheduleBlockHtml,
   type EnvScheduleJson,
+  type NormalizedSchedule,
+  type ScheduleActionConfig,
   type ScheduleInput,
 } from "./schedule.js";
 
 export type { EnvScheduleJson, EnvScheduleActionJson } from "./schedule.js";
+
+/** Onde e como o agendamento é realmente disparado (além do JSON exibido). */
+export type ScheduleTriggerConfig =
+  | {
+      type: "eventbridge-scheduler";
+      group: string;
+      startupScheduleName?: string;
+      shutdownScheduleName?: string;
+    }
+  | {
+      type: "app-autoscaling";
+      resourceId: string;
+      scalableDimension: string;
+      serviceNamespace: "ecs";
+      /** Capacidade (desired count) restaurada no ligamento automático. */
+      restoreCapacity: number;
+      startupActionName?: string;
+      shutdownActionName?: string;
+    };
 
 /** Contrato da config: env ENV_CONFIG (JSON) */
 export interface EnvControlConfig {
@@ -33,6 +62,10 @@ export interface EnvControlConfig {
   token?: string;
   projectName?: string;
   schedule?: ScheduleInput;
+  /** Nome do parâmetro SSM que guarda o agendamento editável em runtime (opcional). */
+  scheduleSsmParam?: string;
+  /** Gatilho real (EventBridge Scheduler ou Application Auto Scaling) atualizado quando o agendamento muda. */
+  scheduleTrigger?: ScheduleTriggerConfig;
 }
 
 interface NormalizedConfig {
@@ -46,6 +79,8 @@ interface NormalizedConfig {
   token: string;
   projectName: string;
   schedule: ReturnType<typeof normalizeSchedule>;
+  scheduleSsmParam: string;
+  scheduleTrigger: ScheduleTriggerConfig | null;
 }
 
 function loadConfig(): NormalizedConfig {
@@ -63,6 +98,8 @@ function loadConfig(): NormalizedConfig {
     token: "",
     projectName: "",
     schedule: null,
+    scheduleSsmParam: "",
+    scheduleTrigger: null,
   };
   if (!raw) return empty;
   try {
@@ -80,6 +117,8 @@ function loadConfig(): NormalizedConfig {
       token: String(parsed.token ?? "").trim(),
       projectName: String(parsed.projectName ?? "").trim(),
       schedule: normalizeSchedule(parsed.schedule),
+      scheduleSsmParam: String(parsed.scheduleSsmParam ?? "").trim(),
+      scheduleTrigger: parsed.scheduleTrigger ?? null,
     };
   } catch {
     return empty;
@@ -89,6 +128,139 @@ function loadConfig(): NormalizedConfig {
 const config = loadConfig();
 const ecs = new ECSClient({ region: config.region });
 const rds = new RDSClient({ region: config.region });
+const ssm = new SSMClient({ region: config.region });
+const scheduler = new SchedulerClient({ region: config.region });
+const autoScaling = new ApplicationAutoScalingClient({ region: config.region });
+
+/**
+ * Agendamento "vivo": lê o valor gravado em SSM (editado via UI/API) quando existir;
+ * cai para o `schedule` estático do ENV_CONFIG quando o parâmetro ainda não foi escrito.
+ */
+async function loadDynamicSchedule(): Promise<NormalizedSchedule | null> {
+  if (!config.scheduleSsmParam) return config.schedule;
+  try {
+    const res = await ssm.send(
+      new GetParameterCommand({ Name: config.scheduleSsmParam })
+    );
+    const raw = res.Parameter?.Value;
+    if (!raw) return config.schedule;
+    const parsed = JSON.parse(raw) as ScheduleInput;
+    return normalizeSchedule(parsed) ?? config.schedule;
+  } catch {
+    return config.schedule;
+  }
+}
+
+async function saveDynamicSchedule(schedule: NormalizedSchedule): Promise<void> {
+  if (!config.scheduleSsmParam) return;
+  await ssm.send(
+    new PutParameterCommand({
+      Name: config.scheduleSsmParam,
+      Value: JSON.stringify(schedule),
+      Type: "String",
+      Overwrite: true,
+    })
+  );
+}
+
+/** Atualiza o gatilho real (EventBridge Scheduler ou Application Auto Scaling) para refletir o novo agendamento. */
+async function applyScheduleTrigger(schedule: NormalizedSchedule): Promise<string[]> {
+  const trigger = config.scheduleTrigger;
+  if (!trigger) return ["Agendamento salvo apenas para exibição — nenhum gatilho automático configurado."];
+  const notices: string[] = [];
+
+  const syncAction = async (
+    kind: "startup" | "shutdown",
+    action: ScheduleActionConfig | undefined
+  ) => {
+    if (trigger.type === "eventbridge-scheduler") {
+      const name = kind === "startup" ? trigger.startupScheduleName : trigger.shutdownScheduleName;
+      if (!name) return;
+      try {
+        const current = await scheduler.send(
+          new GetScheduleCommand({ Name: name, GroupName: trigger.group })
+        );
+        if (action) {
+          const cron = toEventBridgeCron(action.time, action.daysOfWeek);
+          if (!cron) {
+            notices.push(`${kind}: horário/dias inválidos, gatilho não atualizado.`);
+            return;
+          }
+          await scheduler.send(
+            new UpdateScheduleCommand({
+              Name: name,
+              GroupName: trigger.group,
+              ScheduleExpression: cron,
+              ScheduleExpressionTimezone: schedule.timezone,
+              FlexibleTimeWindow: current.FlexibleTimeWindow ?? { Mode: "OFF" },
+              Target: current.Target,
+              State: "ENABLED",
+            })
+          );
+        } else if (current.State !== "DISABLED") {
+          await scheduler.send(
+            new UpdateScheduleCommand({
+              Name: name,
+              GroupName: trigger.group,
+              ScheduleExpression: current.ScheduleExpression,
+              ScheduleExpressionTimezone: current.ScheduleExpressionTimezone,
+              FlexibleTimeWindow: current.FlexibleTimeWindow ?? { Mode: "OFF" },
+              Target: current.Target,
+              State: "DISABLED",
+            })
+          );
+        }
+      } catch (err) {
+        notices.push(`${kind}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+
+    if (trigger.type === "app-autoscaling") {
+      const name = kind === "startup" ? trigger.startupActionName : trigger.shutdownActionName;
+      if (!name) return;
+      try {
+        if (action) {
+          const cron = toEventBridgeCron(action.time, action.daysOfWeek);
+          if (!cron) {
+            notices.push(`${kind}: horário/dias inválidos, gatilho não atualizado.`);
+            return;
+          }
+          await autoScaling.send(
+            new PutScheduledActionCommand({
+              ScheduledActionName: name,
+              ServiceNamespace: trigger.serviceNamespace,
+              ResourceId: trigger.resourceId,
+              ScalableDimension: trigger.scalableDimension as never,
+              Schedule: cron,
+              Timezone: schedule.timezone,
+              ScalableTargetAction:
+                kind === "startup"
+                  ? { MinCapacity: trigger.restoreCapacity, MaxCapacity: trigger.restoreCapacity }
+                  : { MinCapacity: 0, MaxCapacity: 0 },
+            })
+          );
+        } else {
+          await autoScaling.send(
+            new DeleteScheduledActionCommand({
+              ScheduledActionName: name,
+              ServiceNamespace: trigger.serviceNamespace,
+              ResourceId: trigger.resourceId,
+              ScalableDimension: trigger.scalableDimension as never,
+            })
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/not found/i.test(msg)) notices.push(`${kind}: ${msg}`);
+      }
+    }
+  };
+
+  await syncAction("startup", schedule.startup);
+  await syncAction("shutdown", schedule.shutdown);
+  return notices;
+}
 
 const AURORA_OFF_MIN = 0;
 const AURORA_OFF_MAX = 1;
@@ -218,8 +390,8 @@ async function getStatus(): Promise<EnvStatus> {
   return status;
 }
 
-function statusToJson(status: EnvStatus | null): StatusJson {
-  const schedule = buildScheduleJson(config.schedule);
+function statusToJson(status: EnvStatus | null, dynamicSchedule: NormalizedSchedule | null): StatusJson {
+  const schedule = buildScheduleJson(dynamicSchedule);
   const empty: StatusJson = { allOn: false, allOff: true, items: [], ...(schedule ? { schedule } : {}) };
   if (!status) return empty;
   const appOn = (status.appRunning ?? 0) > 0;
@@ -332,13 +504,14 @@ function htmlPage(
   functionUrl: string,
   message = "",
   status: EnvStatus | null = null,
-  options: HtmlPageOptions = {}
+  options: HtmlPageOptions = {},
+  dynamicSchedule: NormalizedSchedule | null = config.schedule
 ): string {
   const { showStartupNotice = false, autoRefreshSeconds = 20 } = options;
   const action = functionUrl || "";
   const tokenRequired = config.token.length > 0;
   const statusHtml = statusBlock(status);
-  const scheduleHtml = scheduleBlockHtml(buildScheduleJson(config.schedule));
+  const scheduleHtml = scheduleBlockHtml(buildScheduleJson(dynamicSchedule));
   const startupNotice = showStartupNotice
     ? `<div class="mb-4 p-3 rounded-lg bg-cyan-900/40 border border-cyan-600/50 text-cyan-200 text-sm">Os serviços podem levar alguns minutos para ficarem disponíveis. A página será atualizada automaticamente; evite clicar novamente.</div>`
     : "";
@@ -443,6 +616,7 @@ export const handler = async (
     } catch {
       // keep null
     }
+    const dynamicSchedule = await loadDynamicSchedule();
     if (
       (event.queryStringParameters?.format === "json") ||
       wantsJson(event)
@@ -450,13 +624,13 @@ export const handler = async (
       return {
         statusCode: 200,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(statusToJson(status)),
+        body: JSON.stringify(statusToJson(status, dynamicSchedule)),
       };
     }
     return {
       statusCode: 200,
       headers: { "Content-Type": "text/html; charset=utf-8" },
-      body: htmlPage(functionUrl, "", status, { autoRefreshSeconds: 20 }),
+      body: htmlPage(functionUrl, "", status, { autoRefreshSeconds: 20 }, dynamicSchedule),
     };
   }
 
@@ -475,17 +649,17 @@ export const handler = async (
   const body = parseBody(rawBody, contentType);
   const action = (body.action ?? "").trim() || (event.queryStringParameters ?? {}).action;
 
-  if (!action || !["on", "off"].includes(action)) {
+  if (!action || !["on", "off", "schedule"].includes(action)) {
     if (wantsJson(event))
       return {
         statusCode: 400,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ error: "Informe action: on ou off." }),
+        body: JSON.stringify({ error: "Informe action: on, off ou schedule." }),
       };
     return {
       statusCode: 200,
       headers: { "Content-Type": "text/html; charset=utf-8" },
-      body: htmlPage(functionUrl, "Informe action: on ou off.", null, {
+      body: htmlPage(functionUrl, "Informe action: on, off ou schedule.", null, {
         autoRefreshSeconds: 20,
       }),
     };
@@ -505,6 +679,49 @@ export const handler = async (
       body: htmlPage(functionUrl, "Token inválido.", null, {
         autoRefreshSeconds: 20,
       }),
+    };
+  }
+
+  if (action === "schedule") {
+    const rawSchedule =
+      typeof body.schedule === "string"
+        ? (() => {
+            try {
+              return JSON.parse(body.schedule as string) as ScheduleInput;
+            } catch {
+              return undefined;
+            }
+          })()
+        : (body as unknown as { schedule?: ScheduleInput }).schedule;
+    const normalized = normalizeSchedule(rawSchedule);
+    if (!normalized) {
+      if (wantsJson(event))
+        return {
+          statusCode: 400,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ error: "Agendamento inválido. Informe schedule: { timezone, startup?, shutdown? }." }),
+        };
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+        body: htmlPage(functionUrl, "Agendamento inválido.", null, { autoRefreshSeconds: 20 }),
+      };
+    }
+    await saveDynamicSchedule(normalized);
+    const notices = await applyScheduleTrigger(normalized);
+    const finalStatus = await getStatus();
+    const payload = statusToJson(finalStatus, normalized);
+    const message = notices.join(". ") || "Agendamento atualizado.";
+    if (wantsJson(event))
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, message }),
+      };
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+      body: htmlPage(functionUrl, message, finalStatus, { autoRefreshSeconds: 20 }, normalized),
     };
   }
 
@@ -597,8 +814,9 @@ export const handler = async (
   }
 
   const finalStatus = await getStatus();
+  const dynamicSchedule = await loadDynamicSchedule();
   if (wantsJson(event)) {
-    const payload = statusToJson(finalStatus);
+    const payload = statusToJson(finalStatus, dynamicSchedule);
     const message =
       messages.join(". ") || (action === "on" ? "Ligando." : "Desligando.");
     return {
@@ -610,9 +828,15 @@ export const handler = async (
   return {
     statusCode: 200,
     headers: { "Content-Type": "text/html; charset=utf-8" },
-    body: htmlPage(functionUrl, messages.join(". ") || undefined, finalStatus, {
-      showStartupNotice: true,
-      autoRefreshSeconds: 20,
-    }),
+    body: htmlPage(
+      functionUrl,
+      messages.join(". ") || undefined,
+      finalStatus,
+      {
+        showStartupNotice: true,
+        autoRefreshSeconds: 20,
+      },
+      dynamicSchedule
+    ),
   };
 };

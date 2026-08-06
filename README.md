@@ -52,7 +52,9 @@ Variável de ambiente na Lambda:
 | `databases.aurora` | Não | Array de IDs de clusters Aurora (escala 0 = desligado) |
 | `token` | Não | Token para POST (vazio = sem proteção) |
 | `projectName` | Não | Nome exibido na UI |
-| `schedule` | Não | Horários fixos semanais de ligar/desligar (ver abaixo) |
+| `schedule` | Não | Horários padrão de ligar/desligar (usados até alguém editar via `action=schedule`) |
+| `scheduleSsmParam` | Não | Nome de um parâmetro SSM (String) onde o agendamento editável em runtime fica gravado |
+| `scheduleTrigger` | Não | Gatilho real (EventBridge Scheduler ou Application Auto Scaling) atualizado quando o agendamento muda — ver "Agendamento configurável em runtime" |
 
 ### Bloco `schedule` (agendamento semanal)
 
@@ -68,7 +70,8 @@ RDS e Aurora podem ser usados ao mesmo tempo (vários de cada).
 
 - **GET** — Página HTML com status, agendamento (se configurado) e botões Ligar/Desligar.
 - **GET ?format=json** ou **Accept: application/json** — JSON de status (exemplo abaixo).
-- **POST** — Ação `on` ou `off`. Body: form-urlencoded ou JSON `{ "action": "on"|"off", "token": "..." }`. Resposta JSON: mesmo shape do GET + `message` ou `{ error: "..." }`.
+- **POST** — Ação `on`, `off` ou `schedule`. Body: form-urlencoded ou JSON `{ "action": "on"|"off"|"schedule", "token": "..." }`. Resposta JSON: mesmo shape do GET + `message` ou `{ error: "..." }`.
+  - `action=schedule` também recebe `schedule` (objeto, ou string JSON se form-urlencoded): `{ timezone, startup?: {enabled,time,daysOfWeek}, shutdown?: {...} }`. Grava em SSM (se `scheduleSsmParam` configurado) e atualiza o gatilho real (se `scheduleTrigger` configurado) — ver "Agendamento configurável em runtime".
 
 Exemplo de resposta JSON:
 
@@ -302,9 +305,97 @@ output "env_control_url" {
 
 Ajuste `filename` e `source_code_hash` se o zip vier do CI. Acesse `env_control_url` no navegador para ligar/desligar o ambiente.
 
-## Agendamento automático (EventBridge Scheduler)
+## Agendamento configurável em runtime (SSM + atualização do gatilho)
 
-A Lambda **não dispara** o agendamento sozinha: configure no Terraform (ou console) regras que fazem **POST** na Function URL com `action=on` (ligar) e `action=off` (desligar). Os horários em `ENV_CONFIG.schedule` devem ser **os mesmos** das regras — o JSON de consulta expõe `schedule.cron` e `schedule.*.nextAt` para UIs como o `dr-env-control`.
+A partir desta versão, o agendamento pode ser **editado depois do deploy** — pela própria Lambda (`action=schedule`) ou por um painel (ex.: `dr-env-control`) — sem precisar rodar `terraform apply` de novo. Isso exige dois pedaços de configuração adicionais em `ENV_CONFIG`:
+
+1. **`scheduleSsmParam`** — nome de um parâmetro SSM (`String`) onde o agendamento vigente fica gravado. Todo `GET`/ação relê esse parâmetro (com fallback para `schedule` estático se o parâmetro ainda não existir ou estiver vazio).
+2. **`scheduleTrigger`** — identifica o recurso real que dispara o liga/desliga, para que `action=schedule` também **atualize a automação de verdade**, não só o JSON exibido. Dois formatos:
+
+```json
+// EventBridge Scheduler (padrão recomendado — timezone nativo)
+"scheduleTrigger": {
+  "type": "eventbridge-scheduler",
+  "group": "env-control",
+  "startupScheduleName": "env-control-startup",
+  "shutdownScheduleName": "env-control-shutdown"
+}
+```
+
+```json
+// Application Auto Scaling (ECS scale-in/out agendado)
+"scheduleTrigger": {
+  "type": "app-autoscaling",
+  "resourceId": "service/meu-cluster/meu-servico",
+  "scalableDimension": "ecs:service:DesiredCount",
+  "serviceNamespace": "ecs",
+  "restoreCapacity": 1,
+  "startupActionName": "web-scale-up",
+  "shutdownActionName": "web-scale-down"
+}
+```
+
+Terraform: crie o parâmetro SSM com `lifecycle { ignore_changes = [value] }` — senão o próximo `apply` sobrescreve o que foi editado via UI de volta para o valor estático do `.tfvars`:
+
+```hcl
+resource "aws_ssm_parameter" "env_control_schedule" {
+  name  = "/env-control/${var.app_name}/schedule"
+  type  = "String"
+  value = jsonencode(local.env_control_config.schedule) # valor inicial só
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+```
+
+E adicione `scheduleSsmParam = aws_ssm_parameter.env_control_schedule.name` e o `scheduleTrigger` correspondente em `local.env_control_config`.
+
+**Permissões IAM adicionais** na role da Lambda:
+
+```hcl
+resource "aws_iam_role_policy" "env_control_schedule" {
+  name = "env-control-schedule"
+  role = aws_iam_role.env_control.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter", "ssm:PutParameter"]
+        Resource = aws_ssm_parameter.env_control_schedule.arn
+      },
+      { # se scheduleTrigger.type == "eventbridge-scheduler"
+        Effect   = "Allow"
+        Action   = ["scheduler:GetSchedule", "scheduler:UpdateSchedule"]
+        Resource = [
+          "arn:aws:scheduler:*:*:schedule/env-control/env-control-startup",
+          "arn:aws:scheduler:*:*:schedule/env-control/env-control-shutdown",
+        ]
+      },
+      { # se scheduleTrigger.type == "app-autoscaling"
+        Effect   = "Allow"
+        Action   = ["application-autoscaling:PutScheduledAction", "application-autoscaling:DeleteScheduledAction"]
+        Resource = "*" # a API de scheduled actions não suporta condição por recurso
+      }
+    ]
+  })
+}
+```
+
+Chamar `action=schedule` (mesmo token do on/off):
+
+```bash
+curl -sS -X POST "${ENV_CONTROL_URL}/?format=json" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"schedule","token":"SEU_TOKEN","schedule":{"timezone":"America/Sao_Paulo","startup":{"enabled":true,"time":"09:00","daysOfWeek":[1,2,3,4,5]},"shutdown":{"enabled":true,"time":"20:00","daysOfWeek":[1,2,3,4,5]}}}'
+```
+
+A resposta é o mesmo JSON de status (com o `schedule` já atualizado) + `message` — inclui um aviso se `scheduleTrigger` não estiver configurado (o valor fica salvo/exibido, mas nenhuma automação real muda).
+
+## Agendamento automático (EventBridge Scheduler) — provisionamento inicial via Terraform
+
+A Lambda **não dispara** o agendamento sozinha: configure no Terraform (ou console) regras que fazem **POST** na Function URL com `action=on` (ligar) e `action=off` (desligar), OU use `scheduleTrigger` acima para deixar o próprio agendamento editável depois. Os horários em `ENV_CONFIG.schedule` devem ser **os mesmos** das regras — o JSON de consulta expõe `schedule.cron` e `schedule.*.nextAt` para UIs como o `dr-env-control`.
 
 ### Exemplo: Scheduler com POST HTTP na Function URL
 
